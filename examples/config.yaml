@@ -1,0 +1,14 @@
+groupVersionResource:
+  group: "apps"
+  version: "v1"
+  resource: "deployments"
+stub:
+  package stub
+
+  printer {
+    help := "# HELP foo foo_help";
+    type := "# TYPE foo gauge";
+    metrics := [sprintf("foo{namespace=\"%s\",name=\"%s\"} %d", [d["metadata"]["namespace"], d["metadata"]["name"], d["spec"]["replicas"]]) | d := input[_]];
+    out := sprintf("%s\n%s\n%s", [help, type, concat("\n", metrics)]);
+    print(out)
+  }
