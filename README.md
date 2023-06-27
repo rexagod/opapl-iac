@@ -42,21 +42,6 @@ that checks for the same is written in [Python]. For now this lives as a target 
 
 [Python]: https://github.com/prometheus/client_python/blob/master/prometheus_client/openmetrics/parser.py#L467
 
-#### Comparing Rego to Common Expression Language (CEL) for this usecase
-
-The points below are not exhautive, but aim to highlight the contrasting differences between the two while
-keeping the targeted usecase in mind.
-
-|Rego  	|CEL  	|
-|:-:	|:-:	|
-|Designed to define policies that enumerate instances of data that reflect the current state of the system.|Designed to parse, check, and evaluate expressions.
-|Supports scalar and composite assignments for variables, including references.|Variables are absent _in the language_, possible explicitly by programmatically supplying values in a data structure to `Program.Eval` (to make it available in the binding environment).
-|Supports Python-like array, set, and object comprehensions.|N/A
-|Supports `import`ing packages, to reuse existing logic and build on it, including the Python-like `future` construct that enables working with newer functionality.|N/A
-
-It's also worth noting that, in addition to a wide range of macros, both allow execution in a sandboxed environment,
-making sure the bindings made available are the only ones that were explicity passed to it.
-
 ### Usage
 
 The configuration requires two fields, one that specifies the GVRs to resolve, and the other one that tells the
@@ -79,13 +64,109 @@ stub:
   }
 ```
 
-This will produce the following metric.
+This will produce the following metrics.
 
 ```yaml
 # HELP foo foo_help
 # TYPE foo gauge
 foo{namespace="kube-system",name="coredns"} 2
 foo{namespace="local-path-storage",name="local-path-provisioner"} 1
+# EOF
+```
+
+#### Simulating CRS featureset entirely by utilizing Rego code stubs
+
+A more-exhaustive [example] is shown below that reproduces all constructs defined in
+[`kube-state-metrics/customresourcestate-metrics.md`] using Rego stubs and generates metrics based on that.
+
+[example]: ./examples/ksm-crs.yaml
+[`kube-state-metrics/customresourcestate-metrics.md`]: https://github.com/kubernetes/kube-state-metrics/blob/main/docs/customresourcestate-metrics.md#multiple-metricskitchen-sink
+
+```yaml
+groupVersionResource:
+  group: "apps"
+  version: "v1"
+  resource: "deployments"
+stub: |
+    package stub
+    import future.keywords.in
+
+    commonLabels := [{"object_type": "native"}] # For objects native to KSM.
+    labelsFromPathName := {"name": ["metadata", "name"]}
+    printer {
+        familyName := "replica_count"
+        familyHelp := sprintf("# HELP %s %s", [familyName, "number of replicas available"])
+        familyType := sprintf("# TYPE %s %s", [familyName, "gauge"])
+        path := ["spec"]
+        labelFromKeyRelative := {"k8s": ["selector", "matchLabels"]}
+        labelsFromPathRelative := {"desired_count": ["replicas"]}
+        valueFromNonRelative := ["status", "availableReplicas"]
+        customLabels := array.concat(commonLabels, [{"custom_metric": "yes"}])
+        unfurlFields := [["metadata", "labels"], ["metadata", "annotations"]]
+        labelFormat := "%s=\"%v\""
+        validationRegex := "\\.|/|-" # https://github.com/kubernetes/kube-state-metrics/pull/2004
+        resolvedPaths := [deployment[p] |
+            deployment := input[_]
+            p := path[_]
+        ]
+        resolvedFormattedLabelsFromPathNonRelative := [sprintf(labelFormat, [regex.replace(k, validationRegex, "_"), o]) |
+            some k, v in labelsFromPathName
+            o := object.get(input[_], v, false)
+        ]
+        resolvedFormattedLabelsFromPathRelative := [sprintf(labelFormat, [regex.replace(k, validationRegex, "_"), o]) |
+            some k, v in labelsFromPathRelative
+            o := object.get(resolvedPaths[_], v, false)
+        ]
+        resolvedFormattedLabelFromKeyRelative := [sprintf(labelFormat, [regex.replace(kk, validationRegex, "_"), vv]) | 
+          some k, v in labelFromKeyRelative
+          o := object.get(resolvedPaths[_], v, false)
+          some kk, vv in o
+          startswith(kk, k)
+        ]
+        resolvedFormattedCustomLabels := [sprintf(labelFormat, [regex.replace(k, validationRegex, "_"), v]) |
+            el := customLabels[_]
+            some k, v in el
+        ]
+            resolvedUnfurlFields := [[o |
+            o := object.get(input[_], el, false)
+        ] |
+            el := unfurlFields[_]
+        ]
+        formattedResolvedUnfurlFields := [sprintf(labelFormat, [regex.replace(k, validationRegex, "_"), v]) |
+            el := resolvedUnfurlFields[_]
+            ell := el[_]
+            some k, v in ell
+        ]
+        values := [o | o := object.get(input[_], valueFromNonRelative, false)]
+        # Generate metrics: familyName{<labelsFromPathRelative>, <labelFromKeyRelative>, <customLabels>, <unfurlFields>} valueFromNonRelative
+        labelSets := [
+            resolvedFormattedLabelsFromPathRelative,
+            resolvedFormattedLabelFromKeyRelative,
+            resolvedFormattedCustomLabels,
+            formattedResolvedUnfurlFields,
+        ]
+        labelSet := [concat(",", arr) |
+            arr := labelSets[_]
+        ]
+        labels := concat(",", labelSet)
+        metricSet := [{sprintf("%s{%s}", [familyName, dedup(withDeployment)]): value} | # https://www.openpolicyagent.org/docs/latest/extensions/#custom-built-in-functions-in-go
+            some i, v in resolvedFormattedLabelsFromPathNonRelative
+            value := values[i]
+            withDeployment := concat(",", [v, labels])
+        ]
+        metrics := [sprintf("%s %d\n", [metric, value]) | some metric,value in metricSet[_]]
+        out := sprintf("%s\n%s\n%s", [familyHelp, familyType, concat("", metrics)])
+        print(out)
+    }
+```
+
+This will produce the following metrics.
+
+```yaml
+# HELP replica_count number of replicas available
+# TYPE replica_count gauge
+replica_count{custom_metric="yes",deployment_kubernetes_io_revision="1",desired_count="1",foo="bar",k8s_app="kube-dns",name="coredns",object_type="native"} 2
+replica_count{custom_metric="yes",deployment_kubernetes_io_revision="1",desired_count="1",foo="bar",k8s_app="kube-dns",name="local-path-provisioner",object_type="native"} 1
 # EOF
 ```
 

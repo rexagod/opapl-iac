@@ -7,8 +7,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 
+	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/types"
 	"gopkg.in/yaml.v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -22,16 +26,13 @@ import (
 
 func main() {
 	// Define command-line flags.
-	kubeconfigPath := *flag.String("kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
-	configurationPath := *flag.String("config", "", "Path to the GVR-rego configuration file.")
-	portNumber := *flag.Int("port", 8080, "Port number to listen on.")
+	var kubeconfigPath string
+	var configurationPath string
+	var portNumber int
+	flag.StringVar(&kubeconfigPath, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
+	flag.StringVar(&configurationPath, "config", "./examples/config.yaml", "Path to the GVR-rego configuration file.")
+	flag.IntVar(&portNumber, "port", 8080, "Port number to listen on.")
 	flag.Parse()
-
-	// TODO: Remove this.
-	configurationPath, err := filepath.Abs("./examples/config.yaml")
-	if err != nil {
-		klog.Fatalf("failed to resolve absolute path to configuration file: %v", err)
-	}
 
 	// Resolve the Kubeconfig.
 	if kubeconfigPath == "" {
@@ -46,10 +47,11 @@ func main() {
 	}
 
 	// Resolve the GVR-rego configuration file.
-	sanitizedConfigurationPath := filepath.Clean(configurationPath)
-	if sanitizedConfigurationPath == "" {
-		klog.Fatalln("configuration path is empty")
+	absoluteFilepath, err := filepath.Abs(configurationPath)
+	if err != nil {
+		klog.Fatalf("failed to resolve absolute path: %v", err)
 	}
+	sanitizedConfigurationPath := filepath.Clean(absoluteFilepath)
 	configurationData, err := os.ReadFile(sanitizedConfigurationPath)
 	if err != nil {
 		klog.Fatalf("failed to read configuration file contents: %v", err)
@@ -83,17 +85,44 @@ func main() {
 		// Process.
 		run := rego.New(
 			rego.Query("data.stub.printer"),
+			rego.Function1(
+				&rego.Function{
+					Name: "dedup",
+					Decl: types.NewFunction(types.Args(types.S), types.S),
+				},
+				func(bctx rego.BuiltinContext, op1 *ast.Term) (*ast.Term, error) {
+					// Deduplicate keys.
+					seen := map[string]string{}
+					arr := strings.Split(string(op1.Value.(ast.String)), ",")
+					for _, labelKV := range arr {
+						kv := strings.Split(labelKV, "=")
+						seen[kv[0]] = labelKV
+					}
+					var deduped []string
+					for _, v := range seen {
+						deduped = append(deduped, v)
+					}
+					// Sort keys for determinism.
+					sort.Strings(deduped)
+					return ast.StringTerm(strings.Join(deduped, ",")), nil
+				},
+			),
 			rego.Module("stub.rego", c.Stub),
 			rego.Input(regoInputItems),
 			rego.EnablePrintStatements(true),
 			rego.PrintHook(topdown.NewPrintHook(&buf)),
 		)
-		_, err = run.Eval(context.Background())
+		stub, err := run.PrepareForEval(context.Background())
+		if err != nil {
+			klog.Fatalf("failed to prepare for evaluation: %v", err)
+		}
+		_, err = stub.Eval(context.Background())
 		if err != nil {
 			klog.Fatalf("failed to evaluate rego query: %v", err)
 		}
 
 		// Write.
+		buf.Truncate(buf.Len() - 1) // Remove trailing newline.
 		_, err = w.Write([]byte(buf.String()))
 		if err != nil {
 			klog.Errorf("failed to write response: %v", err)

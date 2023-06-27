@@ -1,0 +1,75 @@
+groupVersionResource:
+  group: "apps"
+  version: "v1"
+  resource: "deployments"
+stub: |
+    package stub
+    import future.keywords.in
+
+    commonLabels := [{"object_type": "native"}] # For objects native to KSM.
+    labelsFromPathName := {"name": ["metadata", "name"]}
+    printer {
+        familyName := "replica_count"
+        familyHelp := sprintf("# HELP %s %s", [familyName, "number of replicas available"])
+        familyType := sprintf("# TYPE %s %s", [familyName, "gauge"])
+        path := ["spec"]
+        labelFromKeyRelative := {"k8s": ["selector", "matchLabels"]}
+        labelsFromPathRelative := {"desired_count": ["replicas"]}
+        valueFromNonRelative := ["status", "availableReplicas"]
+        customLabels := array.concat(commonLabels, [{"custom_metric": "yes"}])
+        unfurlFields := [["metadata", "labels"], ["metadata", "annotations"]]
+        labelFormat := "%s=\"%v\""
+        validationRegex := "\\.|/|-"
+        resolvedPaths := [deployment[p] |
+            deployment := input[_]
+            p := path[_]
+        ]
+        resolvedFormattedLabelsFromPathNonRelative := [sprintf(labelFormat, [regex.replace(k, validationRegex, "_"), o]) |
+            some k, v in labelsFromPathName
+            o := object.get(input[_], v, false)
+        ]
+        resolvedFormattedLabelsFromPathRelative := [sprintf(labelFormat, [regex.replace(k, validationRegex, "_"), o]) |
+            some k, v in labelsFromPathRelative
+            o := object.get(resolvedPaths[_], v, false)
+        ]
+        resolvedFormattedLabelFromKeyRelative := [sprintf(labelFormat, [regex.replace(kk, validationRegex, "_"), vv]) | 
+          some k, v in labelFromKeyRelative
+          o := object.get(resolvedPaths[_], v, false)
+          some kk, vv in o
+          startswith(kk, k)
+        ]
+        resolvedFormattedCustomLabels := [sprintf(labelFormat, [regex.replace(k, validationRegex, "_"), v]) |
+            el := customLabels[_]
+            some k, v in el
+        ]
+            resolvedUnfurlFields := [[o |
+            o := object.get(input[_], el, false)
+        ] |
+            el := unfurlFields[_]
+        ]
+        formattedResolvedUnfurlFields := [sprintf(labelFormat, [regex.replace(k, validationRegex, "_"), v]) |
+            el := resolvedUnfurlFields[_]
+            ell := el[_]
+            some k, v in ell
+        ]
+        values := [o | o := object.get(input[_], valueFromNonRelative, false)]
+        # Generate metrics: familyName{<labelsFromPathRelative>, <labelFromKeyRelative>, <customLabels>, <unfurlFields>} valueFromNonRelative
+        labelSets := [
+            resolvedFormattedLabelsFromPathRelative,
+            resolvedFormattedLabelFromKeyRelative,
+            resolvedFormattedCustomLabels,
+            formattedResolvedUnfurlFields,
+        ]
+        labelSet := [concat(",", arr) |
+            arr := labelSets[_]
+        ]
+        labels := concat(",", labelSet)
+        metricSet := [{sprintf("%s{%s}", [familyName, dedup(withDeployment)]): value} |
+            some i, v in resolvedFormattedLabelsFromPathNonRelative
+            value := values[i]
+            withDeployment := concat(",", [v, labels])
+        ]
+        metrics := [sprintf("%s %d\n", [metric, value]) | some metric,value in metricSet[_]]
+        out := sprintf("%s\n%s\n%s", [familyHelp, familyType, concat("", metrics)])
+        print(out)
+    }

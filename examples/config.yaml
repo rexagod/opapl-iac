@@ -2,7 +2,7 @@ groupVersionResource:
   group: "apps"
   version: "v1"
   resource: "deployments"
-stub:
+stub: |
   package stub
 
   printer {
